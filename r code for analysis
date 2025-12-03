@@ -1,0 +1,463 @@
+install.packages("randomForest")
+install.packages("caret")
+install.packages("lubridate")
+install.packages("ggplot2")
+install.packages("forecast")
+install.packages("rpart.plot")
+library('forecast')
+library('tseries')
+library(ggplot2)
+library(randomForest)
+library(caret)
+library(readxl)
+library(lubridate)
+library(tidyverse)
+library(data.table)
+library(dplyr)
+library(readr)
+library(stringr)
+library(stringi)
+library(openxlsx)
+library(rpart.plot)
+library(rpart)
+library(tseries)
+
+#case folder
+setwd("C:/data exercises/random forest regression")
+
+electricity_use <- read.csv('Electric_Production.csv') %>% 
+  mutate(DATE=as.Date(DATE, format='%m/%d/%Y'),
+         year=year(DATE),
+         month=month(DATE)) %>%  #1/1/1985
+  arrange(DATE)
+
+
+# Plot electricity use over time, very wiggly
+ggplot(electricity_use, aes(x = DATE, y = electricity_use)) +
+  geom_line(color = "blue", size = 1) +
+  labs(title = "Electricity Use Over Time",
+       x = "Date",
+       y = "Electricity Use (kWh)") +
+  theme_minimal()
+
+
+# test for autocorrelation
+acf(electricity_use$electricity_use, lag.max = 24)   # up to 24 lags
+pacf(electricity_use$electricity_use, lag.max = 24)
+#nothing over 1, and it's over 2 that's most worrying, but let's check more
+
+
+
+
+# Example: test residuals from an ARIMA model
+fit_auto <- auto.arima(electricity_use$electricity_use)
+res_auto <- residuals(fit_auto)
+
+Box.test(res_auto, lag = 24, type = "Ljung-Box")
+#p-value < 2.2e-16
+#A small p-value (< 0.05) means autocorrelation is present.
+  
+# Define split index
+split_index <- floor(0.8 * nrow(electricity_use))
+
+train_data <- electricity_use[1:split_index, ]
+test_data  <- electricity_use[(split_index+1):nrow(electricity_use), ]
+
+set.seed(123)  # for reproducibility
+
+
+
+###try a decision tree
+# Decision tree with rpart
+dt_model <- rpart(electricity_use ~ year + month, data = train_data, method = "anova")
+
+# Predict on test set
+dt_pred <- predict(dt_model, newdata = test_data)
+
+# RMSE for decision tree
+dt_rmse <- sqrt(mean((test_data$electricity_use - dt_pred)^2))
+#6.14
+
+
+# R-squared
+#SST (Total Sum of Squares, Measures the total variability in your dependent variable (electricity_use) around its mean.
+sst <- sum((test_data$electricity_use - mean(test_data$electricity_use))^2)
+
+#SSE (Sum of Squared Errors / Residuals), Measures the unexplained variability — the error left after using your model’s predictions.
+sse <- sum((test_data$electricity_use - dt_pred)^2)
+
+r2 <- 1 - sse/sst
+
+cat("R-squared:", r2, "\n")
+#.59
+
+# Plot the decision tree
+rpart.plot(dt_model, type = 2, extra = 101, fallen.leaves = TRUE)
+
+
+
+
+
+#######now a random forest
+#train rf
+rf_model <- randomForest(
+  electricity_use ~ year + month,
+  data = train_data,
+  ntree = 500,      # number of trees, 500 and 2000 get nearly identical results
+  mtry = 2,         # number of variables tried at each split
+  importance = TRUE
+)
+
+print(rf_model)
+#Mean of squared residuals: 6.815806
+#% Var explained: 96.78, means your Random Forest model explains almost all of the variation in electricity use.
+
+predictions <- predict(rf_model, newdata = test_data)
+
+# RMSE, tells how far your model’s predictions are from the actual observed values, expressed in the same units as your target variable
+rmse <- sqrt(mean((test_data$electricity_use - predictions)^2))
+#RMSE: 3.652195 will compare this to other methods
+
+# R-squared
+#SST (Total Sum of Squares, Measures the total variability in your dependent variable (electricity_use) around its mean.
+sst <- sum((test_data$electricity_use - mean(test_data$electricity_use))^2)
+
+#SSE (Sum of Squared Errors / Residuals), Measures the unexplained variability — the error left after using your model’s predictions.
+sse <- sum((test_data$electricity_use - predictions)^2)
+
+r2 <- 1 - sse/sst
+
+cat("RMSE:", rmse, "\n")
+#RMSE: 3.625988 with 500 ntree
+#when run with just 2 ntree, it gets 3.940141
+cat("R-squared:", r2, "\n")
+#r squared is .86, with 500 ntree quite good, not as good as training though
+#when run with just 2 ntree, it gets .83
+
+#Returns a numerical table of variable importance measures.
+importance(rf_model)
+#year  177.5142, month 159.9724. Close, month and year are pretty similarly impactful
+
+#see residual plot to understand if my prediction is generally fine or getting better or worse. 
+plot(test_data$electricity_use - predictions, type="l", main="Residuals")
+#The residuals are generally even distributed except for some increased variance starting at index 70, with a very large variance approaching index 80. Would want to ask why there is more variation
+
+new_obs_rf_og <- data.frame(
+  year  = 2018,
+  month = 1
+)
+
+pred_rf_og <- predict(rf_model, new_obs_rf_og)
+print(pred_rf_og) #117.32 for Jan 1, 2018
+
+
+###visualize some of the trees
+random_trees <- sample(1:rf_model$ntree, 5)
+
+trees_list <- lapply(random_trees, function(i) {
+  getTree(rf_model, k = i, labelVar = TRUE)
+})
+
+# Inspect one of them
+trees_list[[1]]
+
+# Example: convert one tree manually
+# getTree gives a frame; here’s a helper function
+convert_to_rpart <- function(tree_df, data, response) {
+  # Simplest approach: rebuild a decision tree using the same variables
+  # This won’t be identical to the RF tree, but it’s a faithful approximation
+  rpart(response ~ ., data = data, method = "anova",
+        control = rpart.control(maxdepth = 5))
+}
+
+X <- train_data[, c("year", "month")]
+y <- train_data$electricity_use
+
+# Fit an rpart tree on your dataset for visualization
+tree_vis <- convert_to_rpart(trees[[1]], X, y)
+
+# Plot
+par(mfrow = c(1,1), mar = c(4,4,2,1))  # single plot, smaller margins
+rpart.plot(tree_vis, type = 2, extra = 101)
+
+# Build the second tree
+tree_vis2 <- convert_to_rpart(trees[[2]], X, y)
+
+# Plot the second tree
+rpart.plot(tree_vis2, type = 2, extra = 101, main = "Second Tree")
+#it's basically the same, which is weird, but apparently, most of predictive quality of rf is in a single tree
+
+#######random forest regression is above
+
+
+#some thoughts, rf is better than a decision tree, even with just a single random forest. Reasons:
+#1 Bootstrap Sampling - Random forests train each tree on a bootstrap sample (a resampled version of your training data). That resample may smooth out quirks in the data, leading to a tree that generalizes better than one trained on the full dataset.
+#2 Random Subset of Predictors (mtry). At each split, RF considers only a random subset of predictors. Even with few predictors, this restriction can prevent overfitting and force splits that generalize better.
+#3 Target Distribution & Noise. Electricity use has strong seasonal and trend signals. A single RF tree trained on a bootstrap sample may capture those signals more cleanly than an rpart tree that tries to balance bias/variance with pruning.
+
+
+
+
+
+
+#########doing some diagnostic testing because I get nearly identical RSME's when I have a single rf tree vs 500, we can explore if we do cross validation if we find the 500 tree rf model performs better
+# Define CV setup, we're doing 10 folds, rotating which data is in test vs train
+cv_control <- trainControl(method = "cv", number = 10)
+
+# Single tree
+rf1 <- train(
+  electricity_use ~ year + month,
+  data = train_data,
+  method = "rf",
+  trControl = cv_control,
+  tuneGrid = data.frame(mtry = 2),  # adjust if needed
+  ntree = 1
+)
+
+rf2 <- train(
+  electricity_use ~ year + month,
+  data = train_data,
+  method = "rf",
+  trControl = cv_control,
+  tuneGrid = data.frame(mtry = 2),  # adjust if needed
+  ntree = 2
+)
+
+# 500 trees
+rf500 <- train(
+  electricity_use ~ year + month,
+  data = train_data,
+  method = "rf",
+  trControl = cv_control,
+  tuneGrid = data.frame(mtry = 2),
+  ntree = 500
+)
+
+rf1 #RSME is 4.0 and r2 is .93, pretty good
+rf2 #RSME is 3.6 and r2 is .94, pretty good
+rf500 #RSME is 2.7 and r2 is .97, even better
+
+
+pred_caret <- predict(rf500, newdata = test_data)
+rmse_caret <- sqrt(mean((test_data$electricity_use - pred_caret)^2))
+sse_caret <- sum((test_data$electricity_use - pred_caret)^2)
+sst_caret <- sum((test_data$electricity_use - mean(test_data$electricity_use))^2)
+r2_caret <- 1 - sse_caret/sst_caret
+
+
+###diagnostics above about single vs 500 rf trees
+
+
+
+#####random forest regression with lags below. Maybe that will improve performance
+# Add lag features (1-month, 2-month, 12-month lags)
+electricity_use_lag <- electricity_use %>%
+  mutate(
+    lag1  = lag(electricity_use, 1),
+    lag2  = lag(electricity_use, 2),
+    lag12 = lag(electricity_use, 12)  # yearly seasonality
+  )
+
+#handle missing values
+electricity_use_lag <- na.omit(electricity_use_lag)
+
+# Define split index
+split_index_lag <- floor(0.8 * nrow(electricity_use_lag))
+
+train_data_lag <- electricity_use_lag[1:split_index_lag, ]
+test_data_lag  <- electricity_use_lag[(split_index_lag+1):nrow(electricity_use_lag), ]
+
+# Predictors and target
+X_train <- train_data_lag %>% select(lag1, lag2, lag12, year, month)
+y_train <- train_data_lag$electricity_use
+
+# Fit model
+rf_model_lag <- randomForest(X_train, y_train,
+                             ntree = 500, mtry = 3, importance = TRUE)
+
+# Variable importance
+importance(rf_model_lag)
+varImpPlot(rf_model_lag)
+#lag12 = 57.7 means if you scramble the 12‑month lag, your forecast error increases by ~58%. That’s huge — it’s the most critical predictor. All others are between 12 and 18. electricity demand is highly seasonal year-to-year.
+
+# Predictors and target for test
+X_test <- test_data_lag %>% select(lag1, lag2, lag12, year, month)
+y_test <- test_data_lag$electricity_use
+
+# Predictions
+predictions_lag <- predict(rf_model_lag, X_test)
+
+# RMSE, tells how far your model’s predictions are from the actual observed values, expressed in the same units as your target variable
+rmse_lag <- sqrt(mean((test_data_lag$electricity_use - predictions_lag)^2))
+
+
+# R-squared below
+#SST (Total Sum of Squares, Measures the total variability in your dependent variable (electricity_use) around its mean.
+sst_lag <- sum((test_data_lag$electricity_use - mean(test_data_lag$electricity_use))^2)
+
+#SSE (Sum of Squared Errors / Residuals), Measures the unexplained variability — the error left after using your model’s predictions.
+sse_lag <- sum((test_data_lag$electricity_use - predictions_lag)^2)
+
+r2_lag <- 1 - sse_lag/sst_lag
+
+cat("RMSE:", rmse_lag, "\n")
+#new version with lag is RMSE: 4.07
+#OG version is RMSE: 3.676212, which is better, strange
+cat("R-squared:", r2_lag, "\n")
+#new version with lag is R-squared: 0.82
+#OG version is r squared is .85, quite good, which is better, strange. Maybe it's because we have ~397 monthly observations. That’s relatively small for a high‑variance model like random forest. Adding lag features reduces the effective sample size (because the first 12 rows get dropped for lag12) and increases dimensionality. With fewer rows and more predictors, the model can overfit or become unstable.
+
+
+# Suppose I want to predict Jan 2018
+new_obs <- data.frame(
+  lag1  = tail(electricity_use_lag$electricity_use, 1),       # Dec 2017
+  lag2  = tail(electricity_use_lag$electricity_use, 2)[1],    # Nov 2017
+  lag12 = electricity_use_lag$electricity_use[nrow(electricity_use_lag)-12], # Jan 2017
+  year  = 2018,
+  month = 1
+)
+
+pred <- predict(rf_model_lag, new_obs)
+print(pred) #112.7
+#######random forest regression with lag is above
+
+
+
+
+
+####now going to try seasonal decomp, even just for a nice visual
+freqmonthly = findfrequency(electricity_use$`electricity_use`)
+freqmonthly
+##6 month frequency
+
+#trying at annual frequency bc it is electricty use, which probably follows annual use, but also tried it at 6 months because of freqmonthly result, 12 months get better result
+arima.stl = stl(ts(electricity_use$`electricity_use`, frequency=12), s.window="periodic")
+plot(arima.stl, main = "Seasonality Decomposition")
+
+
+# Convert training data to time series
+train_ts <- ts(train_data$electricity_use, frequency = 12)
+
+# Fit ARIMA model (you can use auto.arima for convenience)
+fit <- auto.arima(train_ts)
+
+# Run residual diagnostics
+checkresiduals(fit)
+
+# Forecast for the length of the test set
+forecast_values <- forecast(fit, h = nrow(test_data))
+
+# Extract predictions
+predictions <- forecast_values$mean
+
+# Actual values
+actuals <- test_data$electricity_use
+
+# Residuals
+residuals <- actuals - predictions
+
+# RMSE
+rmse <- sqrt(mean(residuals^2))
+
+# R-squared (1 - SSE/SST)
+sse <- sum(residuals^2)
+sst <- sum((actuals - mean(actuals))^2)
+r_squared <- 1 - (sse/sst)
+
+cat("RMSE:", rmse, "\n")
+#RMSE: 6.816111, that's nearly double the random forest regression
+cat("R-squared:", r_squared, "\n")
+#R-squared: 0.4921613, compared to rf regression of .85
+
+# Residual plot
+plot(residuals, type = "l", 
+     main = "Residuals",
+     ylab = "Actual - Predicted",
+     xlab = "Index")
+abline(h = 0, col = "red", lty = 2)
+#residuals are nearly always lower and they get lower over time until the final indexes.
+
+#test residuals are always negative
+checkresiduals(ts(residuals))
+
+# Forecast 1 step ahead (January 2018)
+forecast_values_arima <- forecast(fit, h = 12)
+
+# Extract prediction
+jan2018_pred_arima <- forecast_values_arima$mean[1]
+print(jan2018_pred_arima) #102.33 and 
+jan2019_pred_arima <- forecast_values_arima$mean[12]
+print(jan2019_pred_arima) #the 12th next value is 93.2
+###########original arima above
+
+
+
+####tried arima again but with new seasonal parameters, did not improve model at all, so now I am adding log transform (lambda = 0) which hopefully stabilizes variance and can improve residual symmetry
+
+# Assume electricity_use is a numeric vector or column
+par(mfrow = c(2,1))  # two plots stacked
+
+plot(electricity_use$electricity_use,
+     type = "l", col = "blue",
+     main = "Electricity Use (Not Logged)",
+     ylab = "Use", xlab = "Time")
+
+plot(log(electricity_use$electricity_use),
+     type = "l", col = "red",
+     main = "Electricity Use (Logged)",
+     ylab = "Log(Use)", xlab = "Time")
+
+
+
+# Fit auto ARIMA model 
+fit_arima_new <- auto.arima(train_ts, seasonal = TRUE
+                            , lambda = 0 #Box–Cox transformation, adding log transform (lambda = 0) which hopefully stabilizes variance and can improve residual symmetry
+                            ,stepwise = FALSE, approximation = FALSE) #also added stepwise which Forces a more exhaustive search for better-fitting parameters.)
+
+# Run residual diagnostics
+checkresiduals(fit_arima_new)
+
+# Forecast for the length of the test set
+forecast_values_arima_new <- forecast(fit_arima_new, h = nrow(test_data))
+
+# Extract predictions
+predictions_arima_new <- forecast_values_arima_new$mean
+
+# Actual values
+actuals_arima_new <- test_data$electricity_use
+
+# Residuals
+residuals_arima_new <- actuals_arima_new - predictions_arima_new
+
+# RMSE
+rmse_arima_new <- sqrt(mean(residuals_arima_new^2))
+
+# R-squared (1 - SSE/SST)
+sse_arima_new <- sum(residuals_arima_new^2)
+sst_arima_new <- sum((actuals_arima_new - mean(actuals_arima_new))^2)
+r_squared_arima_new <- 1 - (sse_arima_new/sst_arima_new)
+
+cat("RMSE:", rmse_arima_new, "\n")
+#RMSE: 4.102528, much better, but not as good as random forest at 3.6
+cat("R-squared:", r_squared_arima_new, "\n")
+#R-squared: 0.8160264, nearly as good as rf regression
+
+# Residual plot
+plot(residuals_arima_new, type = "l", 
+     main = "Residuals_arima_new",
+     ylab = "Actual_arima_new - Predicted_arima_new",
+     xlab = "Index")
+abline(h = 0, col = "red", lty = 2)
+#residuals are still nearly always lower and they get lower over time until the final indexes. I would not recommend using this
+
+# Forecast 1 step ahead (January 2018)
+forecast_values_arima_log <- forecast(fit_arima_new, h = 12)
+
+# Extract prediction
+jan2018_pred_arima_log <- forecast_values_arima_log$mean[1]
+print(jan2018_pred_arima_log) #102.0 and 
+jan2019_pred_arima_log <- forecast_values_arima_log$mean[12]
+print(jan2019_pred_arima_log) #the 12th next value is 91.8
+########trying new arima above
+
+
